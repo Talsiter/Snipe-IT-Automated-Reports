@@ -46,7 +46,7 @@ Example:
 
 ```php
 $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
-         ->dailyAt('08:00')
+         ->daily()
          ->withoutOverlapping()
          ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
 ```
@@ -82,7 +82,8 @@ Example:
 ESCALATE_AFTER_DAYS=3
 RUN_MODE=live
 DISABLE_WEEKEND=true
-OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+# OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+OVERRIDE_RECIPIENT=""
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
@@ -163,7 +164,7 @@ FAILURE_NOTICE_RECIPIENT_OVERRIDE="you@example.org"
 
 - Script log file: `/var/www/snipeit/storage/logs/expected_checkin_escalation.log`
 - Scheduler output log file: `/var/www/snipeit/storage/logs/expected_checkin_escalation_run.log`
-- Recommended schedule in `Kernel.php`: `dailyAt('08:00')`.
+- Recommended schedule in `Kernel.php`: `daily()`.
 - Runtime user: Laravel scheduler process user (commonly `www-data`).
 - On-call owner: your IT asset management support rotation.
 - Consider logrotate in production to manage growth of log files.

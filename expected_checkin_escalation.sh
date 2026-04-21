@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Version: 1.2.0
+# Version: 1.2.1
 # NOTE: Increment this version for every code change to this script.
 #
 # Expected Check-In Escalation Script
@@ -19,7 +19,7 @@
 #
 # Scheduler integration (Laravel Kernel.php):
 #   $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
-#            ->dailyAt('08:00')
+#            ->daily()
 #            ->withoutOverlapping()
 #            ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
 set -euo pipefail
@@ -33,7 +33,8 @@ TOKEN="PASTE_YOUR_TOKEN_HERE"
 ESCALATE_AFTER_DAYS=3
 RUN_MODE=live
 DISABLE_WEEKEND=true
-OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+# OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+OVERRIDE_RECIPIENT=""
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
