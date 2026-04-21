@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Version: 1.2.1
+# NOTE: Increment this version for every code change to this script.
+#
 # Expected Check-In Escalation Script
 # Location: /var/www/snipeit/expected_checkin_escalation.sh
 #
@@ -14,12 +17,11 @@
 # How to edit:
 #   sudo nano /var/www/snipeit/expected_checkin_escalation.sh
 #
-# How to manage cron:
-#   View:   crontab -l
-#   Add/Edit: crontab -e
-#     Example schedule:
-#       0 8 * * * /var/www/snipeit/expected_checkin_escalation.sh >> /home/administrator/expected_checkin_escalation_run.log 2>&1
-#   Remove: crontab -e   (delete the line above, then save)
+# Scheduler integration (Laravel Kernel.php):
+#   $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
+#            ->daily()
+#            ->withoutOverlapping()
+#            ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
 set -euo pipefail
 
 BASE_URL="http://hpd-assetmanagement/api/v1"
@@ -31,13 +33,14 @@ TOKEN="PASTE_YOUR_TOKEN_HERE"
 ESCALATE_AFTER_DAYS=3
 RUN_MODE=live
 DISABLE_WEEKEND=true
-OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+# OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+OVERRIDE_RECIPIENT=""
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
 FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
 SNIPEIT_PATH="/var/www/snipeit"
-LOG_FILE="/home/administrator/expected_checkin_escalation.log"
+LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
 API_LIMIT=100
 API_OFFSET=0
 # ==============================
