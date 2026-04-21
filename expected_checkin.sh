@@ -1,40 +1,26 @@
 #!/usr/bin/env bash
 
-# Version: 1.4.10
+# Version: 1.2.10
 # NOTE: Increment this version for every code change to this script.
 #
-# Expected Check-In Escalation Script
-# Location: /var/www/snipeit/expected_checkin_escalation.sh
+# Expected Check-In Script (Enhanced)
+# Location: /var/www/snipeit/expected_checkin.sh
 #
-# How to test:
-#   bash -n /var/www/snipeit/expected_checkin_escalation.sh
-#   /var/www/snipeit/expected_checkin_escalation.sh
-#
-# Final validation run settings:
-#   RUN_MODE=dry-run
-#   OVERRIDE_RECIPIENT="jwright@hvillepd.org"
-#
-# How to edit:
-#   sudo nano /var/www/snipeit/expected_checkin_escalation.sh
-#
-# Scheduler integration (Laravel Kernel.php):
-#   $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
-#            ->daily()
-#            ->withoutOverlapping()
-#            ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
+# Purpose:
+#   Replacement-style script for Snipe-IT's built-in expected-checkin behavior,
+#   using the same hardened methodology as expected_checkin_escalation.sh so we
+#   can customize it over time.
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.10"
+SCRIPT_VERSION="1.2.10"
 BASE_URL="http://hpd-assetmanagement/api/v1"
 TOKEN="${SNIPEIT_API_TOKEN:-}"
 
 # ==============================
 # Configuration (edit this block)
 # ==============================
-ESCALATE_AFTER_DAYS=3
 RUN_MODE=live
-DISABLE_WEEKEND=true
-# OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+DISABLE_WEEKEND=false
 OVERRIDE_RECIPIENT=""
 SEND_DRY_RUN_PREVIEW_IF_NONE=true
 DEBUG_LOG=false
@@ -42,10 +28,12 @@ LOG_PII=false
 SEND_FAILURE_NOTICES=true
 FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
 FAILURE_NOTICE_MAX_EVENTS=50
+EMAIL_SIGNATURE_NAME="HPD Asset Management"
+EMAIL_SIGNATURE_ADDRESS="support@hvillepd.org"
 TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
 SNIPEIT_PATH="/var/www/snipeit"
 ENV_FILE="/var/www/snipeit/.env"
-LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
+LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin.log"
 API_LIMIT=100
 API_OFFSET=0
 API_MAX_RETRIES=3
@@ -118,7 +106,7 @@ apply_cli_overrides "$@"
 # RUN_MODE options:
 #   test    = dependency/config/API checks only, no asset processing, no email sends
 #   dry-run = full processing; emails send only when OVERRIDE_RECIPIENT is configured
-#   live    = full processing, escalation emails are sent
+#   live    = full processing and sends notification emails
 case "$RUN_MODE" in
   test|dry-run|live)
     ;;
@@ -143,7 +131,7 @@ log_message() {
   if [[ "$LOG_PII" != "true" ]]; then
     message="$(printf '%s' "$message" | sed -E \
       -e 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/[redacted-email]/g' \
-      -e 's/(assigned_username|manager_username)=[^ ]+/\1=[redacted]/g')"
+      -e 's/(assigned_username|assigned_email)=[^ ]+/\1=[redacted]/g')"
   fi
 
   echo "[$TIMESTAMP] [$level] $message" >> "$LOG_FILE"
@@ -248,9 +236,9 @@ flush_failure_notices() {
     return 0
   fi
 
-  local summary_subject="Snipe-IT Escalation Script Failure Summary ($FAILURE_NOTICE_QUEUED_COUNT events)"
+  local summary_subject="Snipe-IT Expected Check-In Script Failure Summary ($FAILURE_NOTICE_QUEUED_COUNT events)"
   local summary_body
-  summary_body="Failure summary for expected_checkin_escalation.sh
+  summary_body="Failure summary for expected_checkin.sh
 
 Run Date: $TODAY
 Run Mode: $RUN_MODE
@@ -375,8 +363,8 @@ api_get() {
         log_message "ERROR" "API_REQUEST_FAILED context=\"$context\" url=\"$url\""
         if should_send_failure_notice_for_api "$context" "request_failed"; then
           send_failure_notice \
-            "Snipe-IT Escalation Script Failure: API Request Failed" \
-            "The escalation script failed to connect to API endpoint: $url ($context)."
+            "Snipe-IT Expected Check-In Script Failure: API Request Failed" \
+            "The expected check-in script failed to connect to API endpoint: $url ($context)."
         else
           log_message "INFO" "FAILURE_NOTICE_SUPPRESSED context=\"$context\" reason=\"Non-critical API request failure\""
         fi
@@ -402,8 +390,8 @@ api_get() {
     log_message "ERROR" "API_HTTP_ERROR context=\"$context\" url=\"$url\" status=$http_code"
     if should_send_failure_notice_for_api "$context" "$http_code"; then
       send_failure_notice \
-        "Snipe-IT Escalation Script Failure: API HTTP Error" \
-        "The escalation script received HTTP status $http_code from endpoint: $url ($context)."
+        "Snipe-IT Expected Check-In Script Failure: API HTTP Error" \
+        "The expected check-in script received HTTP status $http_code from endpoint: $url ($context)."
     else
       log_message "INFO" "FAILURE_NOTICE_SUPPRESSED context=\"$context\" status=$http_code reason=\"Non-critical API HTTP error\""
     fi
@@ -414,8 +402,8 @@ api_get() {
     echo "API returned malformed JSON for $context"
     log_message "ERROR" "API_JSON_ERROR context=\"$context\" url=\"$url\""
     send_failure_notice \
-      "Snipe-IT Escalation Script Failure: Invalid API JSON" \
-      "The escalation script received malformed JSON from endpoint: $url ($context)."
+      "Snipe-IT Expected Check-In Script Failure: Invalid API JSON" \
+      "The expected check-in script received malformed JSON from endpoint: $url ($context)."
     return 1
   fi
 
@@ -424,10 +412,9 @@ api_get() {
   printf '%s' "$body"
 }
 
-echo "=== Expected Checkin Escalation ==="
+echo "=== Expected Check-In ==="
 echo "Version: $SCRIPT_VERSION"
 echo "Today: $TODAY"
-echo "Escalate After Days: $ESCALATE_AFTER_DAYS"
 echo "Run Mode: $RUN_MODE"
 echo "Disable Weekend: $DISABLE_WEEKEND"
 echo "Override Recipient: ${OVERRIDE_RECIPIENT:-none}"
@@ -435,7 +422,7 @@ echo "Send Failure Notices: $SEND_FAILURE_NOTICES"
 echo "Debug Logging: $DEBUG_LOG"
 echo
 
-log_message "INFO" "RUN_STARTED version=$SCRIPT_VERSION run_mode=$RUN_MODE escalate_after_days=$ESCALATE_AFTER_DAYS override_recipient=${OVERRIDE_RECIPIENT:-none}"
+log_message "INFO" "RUN_STARTED version=$SCRIPT_VERSION run_mode=$RUN_MODE override_recipient=${OVERRIDE_RECIPIENT:-none}"
 
 check_dependencies || exit 1
 resolve_token || exit 1
@@ -465,7 +452,7 @@ if [[ "$DISABLE_WEEKEND" == "true" ]]; then
 fi
 
 processed_count=0
-would_escalate_count=0
+would_notify_count=0
 sent_count=0
 skipped_count=0
 page_count=0
@@ -500,10 +487,6 @@ while true; do
 
     processed_count=$((processed_count + 1))
 
-    echo "=================================================="
-    echo "Processing Asset: $ASSET_TAG"
-    echo
-
     if ! asset_json="$(api_get "$BASE_URL/hardware/bytag/$ASSET_TAG" "asset lookup asset_tag=$ASSET_TAG")"; then
       log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG reason=\"Asset lookup API failure\""
       skipped_count=$((skipped_count + 1))
@@ -527,10 +510,8 @@ while true; do
     checkout_counter="$(json_get "$asset_json" "checkout_counter")"
 
     if [[ -z "$asset_id" ]]; then
-      echo "RESULT: Asset not found. Skipping."
       log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG reason=\"Asset not found from bytag lookup\""
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
@@ -552,28 +533,11 @@ while true; do
       expected_checkin_formatted="$expected_checkin"
     fi
 
-    if [[ "$DEBUG_LOG" == "true" ]]; then
-      echo "Asset ID: $asset_id"
-      echo "Asset Name: $asset_name"
-      echo "Asset Model: $asset_model"
-      echo "Asset Serial: $asset_serial"
-      echo "Assigned User ID: ${assigned_user_id:-none}"
-      echo "Assigned Username: ${assigned_username:-none}"
-      echo "Assigned Name: ${assigned_name:-none}"
-      echo "Assigned Email: ${assigned_email:-none}"
-      echo "Checkout Date: ${last_checkout_formatted:-none}"
-      echo "Expected Checkin: ${expected_checkin_formatted:-none}"
-      echo "Last Checkin: ${last_checkin:-null}"
-      echo "Checkout Counter: ${checkout_counter:-0}"
-      echo "Checkin Counter: ${checkin_counter:-0}"
-      echo
-    fi
-
     if [[ -z "$assigned_user_id" \
        || "${checkout_counter:-0}" -lt 1 \
        || ( -n "${last_checkin:-}" && "$last_checkin" != "null" ) \
        || -z "$expected_checkin" ]]; then
-      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not eligible (not checked out or missing expected check-in)\""
+      log_message "DEBUG" "WOULD_NOT_NOTIFY asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not eligible (not checked out or missing expected check-in)\""
       skipped_count=$((skipped_count + 1))
       continue
     fi
@@ -583,96 +547,51 @@ while true; do
     days_overdue="$(( (today_epoch - expected_epoch) / 86400 ))"
 
     if (( days_overdue < 1 )); then
-      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not overdue\""
+      log_message "DEBUG" "WOULD_NOT_NOTIFY asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not overdue\""
       skipped_count=$((skipped_count + 1))
       continue
     fi
 
-    if ! user_json="$(api_get "$BASE_URL/users/$assigned_user_id" "assigned user lookup id=$assigned_user_id")"; then
-      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Assigned user lookup API failure\""
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    manager_id="$(json_get "$user_json" "manager.id")"
-    manager_name="$(json_get "$user_json" "manager.name")"
-
-    if [[ -z "$manager_id" ]]; then
-      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"No manager assigned in AD\""
+    if [[ -z "$assigned_email" ]]; then
+      log_message "ERROR" "WOULD_NOT_NOTIFY asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Assigned user has no email\""
       send_failure_notice \
-        "Snipe-IT Escalation Notice: Manager Missing in AD" \
-        "The escalation script could not send a manager notification for asset tag $ASSET_TAG because no manager is configured for assigned user '$assigned_name' (user ID: $assigned_user_id)."
+        "Snipe-IT Expected Check-In Notice: Assigned User Missing Email" \
+        "The expected check-in script could not notify assigned user '$assigned_name' (user ID: $assigned_user_id) for asset tag $ASSET_TAG because no email address is configured."
       skipped_count=$((skipped_count + 1))
       continue
-    fi
-
-    if ! manager_json="$(api_get "$BASE_URL/users/$manager_id" "manager lookup id=$manager_id")"; then
-      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager lookup API failure\""
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    manager_email="$(json_get "$manager_json" "email")"
-    manager_username="$(json_get "$manager_json" "username")"
-    manager_activated="$(json_get "$manager_json" "activated")"
-
-    if [[ -z "$manager_email" ]]; then
-      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager has no email\""
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    if [[ "$manager_activated" != "true" ]]; then
-      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager not activated\""
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    if (( days_overdue >= ESCALATE_AFTER_DAYS )); then
-      should_escalate="true"
-    else
-      should_escalate="false"
     fi
 
     if [[ -n "$OVERRIDE_RECIPIENT" ]]; then
       final_recipient="$OVERRIDE_RECIPIENT"
     else
-      final_recipient="$manager_email"
+      final_recipient="$assigned_email"
     fi
 
-    if [[ "$should_escalate" != "true" ]]; then
-      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Below threshold\""
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    would_escalate_count=$((would_escalate_count + 1))
+    would_notify_count=$((would_notify_count + 1))
 
     EMAIL_SUBJECT="HPD Asset Management Notice: Asset Overdue for Check-In – $ASSET_TAG"
-    EMAIL_BODY="$manager_name,
+    EMAIL_BODY="$assigned_name,
 
-HPD Asset Management is sending this notice because the following asset assigned to $assigned_name appears to be overdue for check-in.
+This is an automated reminder that the following asset assigned to you appears overdue for check-in.
 
 Asset Details
 - Asset Tag: $ASSET_TAG
 - Asset Name: $asset_name
 - Model: $asset_model
 - Serial Number: $asset_serial
-- Assigned To: $assigned_name
-- Assigned User Email: $assigned_email
 - Checkout Date: $last_checkout_formatted
 - Expected Check-In Date: $expected_checkin_formatted
 - Days Overdue: $days_overdue
 
-If this notice is incorrect, please forward this message to support@hvillepd.org and explain why the asset is not overdue for check-in.
+If this notice is incorrect, please reply to $EMAIL_SIGNATURE_ADDRESS with details.
 
-If the expected check-in date should be extended, either the assigned employee or their supervisor may request an extension by forwarding this message to support@hvillepd.org and providing:
+If you need to request an extension, reply with:
 - the new requested check-in date
 - the reason for the extension
 
 Thank you,
-HPD Asset Management
-support@hvillepd.org"
+$EMAIL_SIGNATURE_NAME
+$EMAIL_SIGNATURE_ADDRESS"
 
     should_send_email="false"
     if [[ "$RUN_MODE" == "live" ]]; then
@@ -690,44 +609,44 @@ $EMAIL_BODY"
       fi
 
       send_output="$(send_email_laravel "$final_recipient" "$EMAIL_SUBJECT" "$EMAIL_BODY")" || {
-        log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient error=\"$send_output\""
+        log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email error=\"$send_output\""
         send_failure_notice \
-          "Snipe-IT Escalation Script Failure: Manager Email Send Failed" \
-          "The script failed to send escalation email for asset tag $ASSET_TAG to $final_recipient. Error: $send_output"
+          "Snipe-IT Expected Check-In Script Failure: Notification Email Send Failed" \
+          "The script failed to send expected check-in email for asset tag $ASSET_TAG to $final_recipient. Error: $send_output"
         continue
       }
 
-      log_message "INFO" "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient manager_username=$manager_username manager_email=$manager_email days_overdue=$days_overdue"
+      log_message "INFO" "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue"
       sent_count=$((sent_count + 1))
     else
-      log_message "INFO" "WOULD_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient manager_username=$manager_username manager_email=$manager_email days_overdue=$days_overdue run_mode=$RUN_MODE"
+      log_message "INFO" "WOULD_NOTIFY asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue run_mode=$RUN_MODE"
     fi
   done <<< "$asset_tags"
 
   API_OFFSET=$((API_OFFSET + API_LIMIT))
 done
 
-if (( would_escalate_count == 0 )); then
-  log_message "INFO" "RUN_RESULT no_assets_escalated processed=$processed_count skipped=$skipped_count"
+if (( would_notify_count == 0 )); then
+  log_message "INFO" "RUN_RESULT no_assets_notified processed=$processed_count skipped=$skipped_count"
 
   if [[ "$RUN_MODE" == "dry-run" && -n "$OVERRIDE_RECIPIENT" && "$SEND_DRY_RUN_PREVIEW_IF_NONE" == "true" ]]; then
-    preview_subject="[DRY-RUN] HPD Asset Management Escalation Preview (No Overdue Assets)"
+    preview_subject="[DRY-RUN] HPD Asset Management Expected Check-In Preview (No Overdue Assets)"
     preview_body="This is a dry-run preview email.
 
-RUN_MODE is set to dry-run and OVERRIDE_RECIPIENT is configured, but there were no assets eligible for escalation in this run.
+RUN_MODE is set to dry-run and OVERRIDE_RECIPIENT is configured, but there were no overdue assets eligible for notification in this run.
 
 No action is required.
 
 Thank you,
-HPD Asset Management
-support@hvillepd.org"
+$EMAIL_SIGNATURE_NAME
+$EMAIL_SIGNATURE_ADDRESS"
 
     preview_send_output="$(send_email_laravel "$OVERRIDE_RECIPIENT" "$preview_subject" "$preview_body")" || {
       log_message "ERROR" "DRY_RUN_PREVIEW_SEND_FAILED final_recipient=$OVERRIDE_RECIPIENT error=\"$preview_send_output\""
       send_failure_notice \
-        "Snipe-IT Escalation Script Failure: Dry-Run Preview Email Send Failed" \
+        "Snipe-IT Expected Check-In Script Failure: Dry-Run Preview Email Send Failed" \
         "The script failed to send dry-run preview email to $OVERRIDE_RECIPIENT. Error: $preview_send_output"
-      log_message "INFO" "RUN_SUMMARY processed=$processed_count would_escalate=$would_escalate_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
+      log_message "INFO" "RUN_SUMMARY processed=$processed_count would_notify=$would_notify_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
       exit 1
     }
 
@@ -739,9 +658,9 @@ fi
 echo "=================================================="
 echo "SUMMARY"
 echo "Processed Assets: $processed_count"
-echo "Would Escalate: $would_escalate_count"
+echo "Would Notify: $would_notify_count"
 echo "Emails Sent: $sent_count"
-echo "Skipped / No Escalation: $skipped_count"
+echo "Skipped / No Notification: $skipped_count"
 echo "Log File: $LOG_FILE"
 
-log_message "INFO" "RUN_SUMMARY processed=$processed_count would_escalate=$would_escalate_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
+log_message "INFO" "RUN_SUMMARY processed=$processed_count would_notify=$would_notify_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
