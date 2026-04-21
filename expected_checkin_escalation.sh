@@ -1,32 +1,87 @@
 #!/usr/bin/env bash
 
+# Version: 1.2.0
+# NOTE: Increment this version for every code change to this script.
+#
+# Expected Check-In Escalation Script
+# Location: /var/www/snipeit/expected_checkin_escalation.sh
+#
+# How to test:
+#   bash -n /var/www/snipeit/expected_checkin_escalation.sh
+#   /var/www/snipeit/expected_checkin_escalation.sh
+#
+# Final validation run settings:
+#   RUN_MODE=dry-run
+#   OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+#
+# How to edit:
+#   sudo nano /var/www/snipeit/expected_checkin_escalation.sh
+#
+# Scheduler integration (Laravel Kernel.php):
+#   $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
+#            ->dailyAt('08:00')
+#            ->withoutOverlapping()
+#            ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
 set -euo pipefail
 
 BASE_URL="http://hpd-assetmanagement/api/v1"
 TOKEN="PASTE_YOUR_TOKEN_HERE"
 
+# ==============================
+# Configuration (edit this block)
+# ==============================
 ESCALATE_AFTER_DAYS=3
-DRY_RUN=true
+RUN_MODE=live
 DISABLE_WEEKEND=true
-
-# For controlled testing, keep this set to your address.
-# Leave blank to use the actual manager email.
 OVERRIDE_RECIPIENT="jwright@hvillepd.org"
-
-LOG_FILE="/home/administrator/expected_checkin_escalation.log"
-TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-TODAY="$(date +%F)"
+DEBUG_LOG=false
+LOG_PII=false
+SEND_FAILURE_NOTICES=true
+FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
 SNIPEIT_PATH="/var/www/snipeit"
-
-# Pagination settings
+LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
 API_LIMIT=100
 API_OFFSET=0
+# ==============================
+# Configuration (end)
+# ==============================
 
-api_get() {
-  curl -s \
-    -H "Accept: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    "$1"
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+TODAY="$(date +%F)"
+FAILURE_NOTICE_RECIPIENT=""
+
+# RUN_MODE options:
+#   test    = dependency/config/API checks only, no asset processing, no email sends
+#   dry-run = full processing, no escalation emails sent
+#   live    = full processing, escalation emails are sent
+case "$RUN_MODE" in
+  test|dry-run|live)
+    ;;
+  *)
+    echo "Invalid RUN_MODE: $RUN_MODE (use: test, dry-run, live)"
+    exit 1
+    ;;
+esac
+
+log_message() {
+  local level="$1"
+  local message="$2"
+  local log_dir
+
+  if [[ "$level" == "DEBUG" && "$DEBUG_LOG" != "true" ]]; then
+    return 0
+  fi
+
+  log_dir="$(dirname "$LOG_FILE")"
+  mkdir -p "$log_dir"
+
+  if [[ "$LOG_PII" != "true" ]]; then
+    message="$(printf '%s' "$message" | sed -E \
+      -e 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/[redacted-email]/g' \
+      -e 's/(assigned_username|manager_username)=[^ ]+/\1=[redacted]/g')"
+  fi
+
+  echo "[$TIMESTAMP] [$level] $message" >> "$LOG_FILE"
 }
 
 json_get() {
@@ -76,10 +131,6 @@ for row in data.get("rows", []):
 '
 }
 
-log_message() {
-  echo "[$TIMESTAMP] $1" >> "$LOG_FILE"
-}
-
 send_email_laravel() {
   local recipient="$1"
   local subject="$2"
@@ -97,19 +148,156 @@ Mail::raw(getenv('MAIL_BODY'), function (\$message) {
 " 2>&1
 }
 
-echo "=== Expected Checkin Escalation Test ==="
+send_failure_notice() {
+  local subject="$1"
+  local body="$2"
+
+  if [[ "$SEND_FAILURE_NOTICES" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$FAILURE_NOTICE_RECIPIENT" ]]; then
+    log_message "ERROR" "FAILURE_NOTICE_SKIPPED reason=\"No failure notice recipient configured\""
+    return 0
+  fi
+
+  local send_output
+  send_output="$(send_email_laravel "$FAILURE_NOTICE_RECIPIENT" "$subject" "$body")" || {
+    log_message "ERROR" "FAILURE_NOTICE_SEND_FAILED recipient=$FAILURE_NOTICE_RECIPIENT error=\"$send_output\""
+    return 1
+  }
+
+  log_message "INFO" "FAILURE_NOTICE_SENT recipient=$FAILURE_NOTICE_RECIPIENT subject=\"$subject\""
+}
+
+resolve_failure_notice_recipient() {
+  if [[ -n "$FAILURE_NOTICE_RECIPIENT_OVERRIDE" ]]; then
+    FAILURE_NOTICE_RECIPIENT="$FAILURE_NOTICE_RECIPIENT_OVERRIDE"
+    return 0
+  fi
+
+  cd "$SNIPEIT_PATH"
+  local resolved
+  resolved="$(php artisan tinker --execute="echo setting('alert_email') ?: config('mail.from.address');" 2>/dev/null | tail -n 1 | tr -d '\r' | xargs)"
+
+  if [[ -n "$resolved" && "$resolved" != "null" ]]; then
+    FAILURE_NOTICE_RECIPIENT="$resolved"
+    return 0
+  fi
+
+  FAILURE_NOTICE_RECIPIENT=""
+  return 1
+}
+
+check_dependencies() {
+  local missing=0
+  local cmd
+
+  for cmd in curl python3 php date sed; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Missing dependency: $cmd"
+      log_message "ERROR" "DEPENDENCY_MISSING command=$cmd"
+      missing=1
+    fi
+  done
+
+  if [[ ! -d "$SNIPEIT_PATH" ]]; then
+    echo "Missing Snipe-IT path: $SNIPEIT_PATH"
+    log_message "ERROR" "DEPENDENCY_MISSING_PATH path=$SNIPEIT_PATH"
+    missing=1
+  fi
+
+  if [[ $missing -ne 0 ]]; then
+    echo "Dependency checks failed."
+    return 1
+  fi
+
+  return 0
+}
+
+is_valid_json() {
+  local payload="$1"
+  printf '%s' "$payload" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1
+}
+
+api_get() {
+  local url="$1"
+  local context="$2"
+  local response
+  local http_code
+  local body
+
+  response="$(curl -sS --connect-timeout 15 --max-time 60 \
+    -H "Accept: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -w $'\n%{http_code}' \
+    "$url")" || {
+      echo "API request failed for $context"
+      log_message "ERROR" "API_REQUEST_FAILED context=\"$context\" url=\"$url\""
+      send_failure_notice \
+        "Snipe-IT Escalation Script Failure: API Request Failed" \
+        "The escalation script failed to connect to API endpoint: $url ($context)."
+      return 1
+    }
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "API returned HTTP $http_code for $context"
+    log_message "ERROR" "API_HTTP_ERROR context=\"$context\" url=\"$url\" status=$http_code"
+    send_failure_notice \
+      "Snipe-IT Escalation Script Failure: API HTTP Error" \
+      "The escalation script received HTTP status $http_code from endpoint: $url ($context)."
+    return 1
+  fi
+
+  if ! is_valid_json "$body"; then
+    echo "API returned malformed JSON for $context"
+    log_message "ERROR" "API_JSON_ERROR context=\"$context\" url=\"$url\""
+    send_failure_notice \
+      "Snipe-IT Escalation Script Failure: Invalid API JSON" \
+      "The escalation script received malformed JSON from endpoint: $url ($context)."
+    return 1
+  fi
+
+  log_message "DEBUG" "API_SUCCESS context=\"$context\" url=\"$url\""
+  printf '%s' "$body"
+}
+
+echo "=== Expected Checkin Escalation ==="
 echo "Today: $TODAY"
 echo "Escalate After Days: $ESCALATE_AFTER_DAYS"
-echo "Dry Run Mode: $DRY_RUN"
+echo "Run Mode: $RUN_MODE"
 echo "Disable Weekend: $DISABLE_WEEKEND"
 echo "Override Recipient: ${OVERRIDE_RECIPIENT:-none}"
+echo "Send Failure Notices: $SEND_FAILURE_NOTICES"
+echo "Debug Logging: $DEBUG_LOG"
 echo
+
+log_message "INFO" "RUN_STARTED run_mode=$RUN_MODE escalate_after_days=$ESCALATE_AFTER_DAYS override_recipient=${OVERRIDE_RECIPIENT:-none}"
+
+check_dependencies || exit 1
+resolve_failure_notice_recipient || log_message "ERROR" "FAILURE_NOTICE_RECIPIENT_NOT_FOUND source=\"Snipe-IT Email Preferences\""
+
+if [[ "$RUN_MODE" == "test" ]]; then
+  echo "TEST MODE: Running API health check only."
+  if api_get "$BASE_URL/hardware?limit=1&offset=0" "test-mode hardware health check" >/dev/null; then
+    echo "TEST MODE RESULT: API health check passed."
+    log_message "INFO" "TEST_MODE_SUCCESS"
+    exit 0
+  else
+    echo "TEST MODE RESULT: API health check failed."
+    log_message "ERROR" "TEST_MODE_FAILED"
+    exit 1
+  fi
+fi
 
 if [[ "$DISABLE_WEEKEND" == "true" ]]; then
   day_of_week="$(date +%u)"
   if [[ "$day_of_week" == "6" || "$day_of_week" == "7" ]]; then
     echo "Weekend detected. Processing disabled."
-    log_message "SKIPPED reason=\"Weekend processing disabled\" dry_run=$DRY_RUN"
+    log_message "INFO" "SKIPPED reason=\"Weekend processing disabled\" run_mode=$RUN_MODE"
     exit 0
   fi
 fi
@@ -125,7 +313,11 @@ while true; do
   page_count=$((page_count + 1))
 
   echo "Retrieving asset page $page_count (offset=$API_OFFSET, limit=$API_LIMIT)..."
-  assets_json="$(api_get "$BASE_URL/hardware?limit=$API_LIMIT&offset=$API_OFFSET")"
+  if ! assets_json="$(api_get "$BASE_URL/hardware?limit=$API_LIMIT&offset=$API_OFFSET" "hardware list page=$page_count")"; then
+    echo "Stopping run due to API list failure."
+    log_message "ERROR" "RUN_ABORTED reason=\"Hardware list API failure\" page=$page_count"
+    break
+  fi
 
   if [[ $page_count -eq 1 ]]; then
     total_assets="$(json_get "$assets_json" "total")"
@@ -150,7 +342,11 @@ while true; do
     echo "Processing Asset: $ASSET_TAG"
     echo
 
-    asset_json="$(api_get "$BASE_URL/hardware/bytag/$ASSET_TAG")"
+    if ! asset_json="$(api_get "$BASE_URL/hardware/bytag/$ASSET_TAG" "asset lookup asset_tag=$ASSET_TAG")"; then
+      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG reason=\"Asset lookup API failure\""
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
 
     asset_id="$(json_get "$asset_json" "id")"
     asset_name="$(json_get "$asset_json" "name")"
@@ -170,7 +366,7 @@ while true; do
 
     if [[ -z "$asset_id" ]]; then
       echo "RESULT: Asset not found. Skipping."
-      log_message "SKIPPED asset_tag=$ASSET_TAG reason=\"Asset not found from bytag lookup\""
+      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG reason=\"Asset not found from bytag lookup\""
       skipped_count=$((skipped_count + 1))
       echo
       continue
@@ -194,30 +390,29 @@ while true; do
       expected_checkin_formatted="$expected_checkin"
     fi
 
-    echo "Asset ID: $asset_id"
-    echo "Asset Name: $asset_name"
-    echo "Asset Model: $asset_model"
-    echo "Asset Serial: $asset_serial"
-    echo "Assigned User ID: ${assigned_user_id:-none}"
-    echo "Assigned Username: ${assigned_username:-none}"
-    echo "Assigned Name: ${assigned_name:-none}"
-    echo "Assigned Email: ${assigned_email:-none}"
-    echo "Checkout Date: ${last_checkout_formatted:-none}"
-    echo "Expected Checkin: ${expected_checkin_formatted:-none}"
-    echo "Last Checkin: ${last_checkin:-null}"
-    echo "Checkout Counter: ${checkout_counter:-0}"
-    echo "Checkin Counter: ${checkin_counter:-0}"
-    echo
+    if [[ "$DEBUG_LOG" == "true" ]]; then
+      echo "Asset ID: $asset_id"
+      echo "Asset Name: $asset_name"
+      echo "Asset Model: $asset_model"
+      echo "Asset Serial: $asset_serial"
+      echo "Assigned User ID: ${assigned_user_id:-none}"
+      echo "Assigned Username: ${assigned_username:-none}"
+      echo "Assigned Name: ${assigned_name:-none}"
+      echo "Assigned Email: ${assigned_email:-none}"
+      echo "Checkout Date: ${last_checkout_formatted:-none}"
+      echo "Expected Checkin: ${expected_checkin_formatted:-none}"
+      echo "Last Checkin: ${last_checkin:-null}"
+      echo "Checkout Counter: ${checkout_counter:-0}"
+      echo "Checkin Counter: ${checkin_counter:-0}"
+      echo
+    fi
 
     if [[ -z "$assigned_user_id" \
        || "${checkout_counter:-0}" -lt 1 \
        || ( -n "${last_checkin:-}" && "$last_checkin" != "null" ) \
        || -z "$expected_checkin" ]]; then
-
-      echo "RESULT: Asset not eligible (not checked out OR no expected check-in). No escalation."
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not eligible (not checked out or missing expected check-in)\" dry_run=$DRY_RUN"
+      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not eligible (not checked out or missing expected check-in)\""
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
@@ -225,58 +420,49 @@ while true; do
     today_epoch="$(date -d "$TODAY" +%s)"
     days_overdue="$(( (today_epoch - expected_epoch) / 86400 ))"
 
-    echo "Days Overdue: $days_overdue"
-    echo
-
     if (( days_overdue < 1 )); then
-      echo "RESULT: Asset is not overdue. No escalation."
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS reason=\"Not overdue\" dry_run=$DRY_RUN"
+      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Not overdue\""
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
-    user_json="$(api_get "$BASE_URL/users/$assigned_user_id")"
+    if ! user_json="$(api_get "$BASE_URL/users/$assigned_user_id" "assigned user lookup id=$assigned_user_id")"; then
+      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Assigned user lookup API failure\""
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
 
     manager_id="$(json_get "$user_json" "manager.id")"
     manager_name="$(json_get "$user_json" "manager.name")"
 
-    echo "Manager ID: ${manager_id:-none}"
-    echo "Manager Name: ${manager_name:-none}"
-    echo
-
     if [[ -z "$manager_id" ]]; then
-      echo "RESULT: Assigned user has no manager. No escalation."
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS reason=\"No manager assigned\" dry_run=$DRY_RUN"
+      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"No manager assigned in AD\""
+      send_failure_notice \
+        "Snipe-IT Escalation Notice: Manager Missing in AD" \
+        "The escalation script could not send a manager notification for asset tag $ASSET_TAG because no manager is configured for assigned user '$assigned_name' (user ID: $assigned_user_id)."
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
-    manager_json="$(api_get "$BASE_URL/users/$manager_id")"
+    if ! manager_json="$(api_get "$BASE_URL/users/$manager_id" "manager lookup id=$manager_id")"; then
+      log_message "ERROR" "SKIPPED asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager lookup API failure\""
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
 
     manager_email="$(json_get "$manager_json" "email")"
     manager_username="$(json_get "$manager_json" "username")"
     manager_activated="$(json_get "$manager_json" "activated")"
 
-    echo "Manager Username: ${manager_username:-none}"
-    echo "Manager Email: ${manager_email:-none}"
-    echo "Manager Activated: ${manager_activated:-false}"
-    echo
-
     if [[ -z "$manager_email" ]]; then
-      echo "RESULT: Manager has no email. No escalation."
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username manager_username=$manager_username days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS reason=\"Manager has no email\" dry_run=$DRY_RUN"
+      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager has no email\""
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
     if [[ "$manager_activated" != "true" ]]; then
-      echo "RESULT: Manager is not activated. No escalation."
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username manager_username=$manager_username manager_email=$manager_email days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS reason=\"Manager not activated\" dry_run=$DRY_RUN"
+      log_message "ERROR" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Manager not activated\""
       skipped_count=$((skipped_count + 1))
-      echo
       continue
     fi
 
@@ -292,8 +478,15 @@ while true; do
       final_recipient="$manager_email"
     fi
 
-    EMAIL_SUBJECT="HPD Asset Management Notice: Asset Overdue for Check-In – $ASSET_TAG"
+    if [[ "$should_escalate" != "true" ]]; then
+      log_message "DEBUG" "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id reason=\"Below threshold\""
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
 
+    would_escalate_count=$((would_escalate_count + 1))
+
+    EMAIL_SUBJECT="HPD Asset Management Notice: Asset Overdue for Check-In – $ASSET_TAG"
     EMAIL_BODY="$manager_name,
 
 HPD Asset Management is sending this notice because the following asset assigned to $assigned_name appears to be overdue for check-in.
@@ -319,53 +512,20 @@ Thank you,
 HPD Asset Management
 support@hvillepd.org"
 
-    echo "Email Subject: $EMAIL_SUBJECT"
-    echo "Email Recipient: $final_recipient"
-    echo "Email Body:"
-    echo "$EMAIL_BODY"
-    echo
-
-    echo "=== RESULT ==="
-    if [[ "$should_escalate" == "true" ]]; then
-      echo "WOULD ESCALATE"
-      echo "Reason: Asset is $days_overdue day(s) overdue, which meets or exceeds the threshold of $ESCALATE_AFTER_DAYS."
-      echo "Target Manager: $manager_name <$manager_email>"
-      echo "Actual Recipient For This Run: $final_recipient"
-      would_escalate_count=$((would_escalate_count + 1))
-    else
-      echo "WOULD NOT ESCALATE"
-      echo "Reason: Asset is only $days_overdue day(s) overdue, which is below the threshold of $ESCALATE_AFTER_DAYS."
-      skipped_count=$((skipped_count + 1))
-    fi
-    echo
-
-    if [[ "$should_escalate" == "true" ]]; then
-      log_message "WOULD_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username assigned_email=$assigned_email manager_username=$manager_username manager_email=$manager_email final_recipient=$final_recipient days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS dry_run=$DRY_RUN subject=\"$EMAIL_SUBJECT\""
-    else
-      log_message "WOULD_NOT_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id assigned_username=$assigned_username assigned_email=$assigned_email manager_username=$manager_username manager_email=$manager_email final_recipient=$final_recipient days_overdue=$days_overdue threshold=$ESCALATE_AFTER_DAYS dry_run=$DRY_RUN reason=\"Below threshold\""
-    fi
-
-    if [[ "$should_escalate" == "true" && "$DRY_RUN" == "false" ]]; then
-      echo "LIVE MODE ACTIVE: Attempting to send email via Laravel..."
+    if [[ "$RUN_MODE" == "live" ]]; then
       send_output="$(send_email_laravel "$final_recipient" "$EMAIL_SUBJECT" "$EMAIL_BODY")" || {
-        echo "EMAIL SEND FAILED"
-        echo "$send_output"
-        log_message "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient error=\"$send_output\""
-        echo
+        log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient error=\"$send_output\""
+        send_failure_notice \
+          "Snipe-IT Escalation Script Failure: Manager Email Send Failed" \
+          "The script failed to send escalation email for asset tag $ASSET_TAG to $final_recipient. Error: $send_output"
         continue
       }
 
-      echo "$send_output"
-      echo "EMAIL SENT"
-      log_message "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient subject=\"$EMAIL_SUBJECT\""
+      log_message "INFO" "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient manager_username=$manager_username manager_email=$manager_email days_overdue=$days_overdue"
       sent_count=$((sent_count + 1))
-    elif [[ "$DRY_RUN" == "true" ]]; then
-      echo "DRY RUN ACTIVE: No email was sent."
     else
-      echo "LIVE MODE ACTIVE: No email sent because threshold was not met."
+      log_message "INFO" "WOULD_ESCALATE asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient manager_username=$manager_username manager_email=$manager_email days_overdue=$days_overdue run_mode=$RUN_MODE"
     fi
-
-    echo
   done <<< "$asset_tags"
 
   API_OFFSET=$((API_OFFSET + API_LIMIT))
@@ -378,3 +538,9 @@ echo "Would Escalate: $would_escalate_count"
 echo "Emails Sent: $sent_count"
 echo "Skipped / No Escalation: $skipped_count"
 echo "Log File: $LOG_FILE"
+
+if (( would_escalate_count == 0 )); then
+  log_message "INFO" "RUN_RESULT no_assets_escalated processed=$processed_count skipped=$skipped_count"
+fi
+
+log_message "INFO" "RUN_SUMMARY processed=$processed_count would_escalate=$would_escalate_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
