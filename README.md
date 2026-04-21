@@ -2,6 +2,11 @@
 
 This repository contains a Bash automation script that checks Snipe-IT assets for overdue expected check-ins and sends escalation notices.
 
+## Versioning requirement
+
+- The script has a version header at the top (`# Version: x.y.z`).
+- **Increment this version on every script code change**.
+
 ## Script location in production
 
 The script should be located at:
@@ -33,33 +38,18 @@ Use:
 sudo nano /var/www/snipeit/expected_checkin_escalation.sh
 ```
 
-## How to manage cron schedule
+## Scheduler integration (Laravel Kernel.php)
 
-### View existing cron jobs
+This script is now scheduled from Laravel `Kernel.php` instead of system cron.
 
-```bash
-crontab -l
+Example:
+
+```php
+$schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
+         ->daily()
+         ->withoutOverlapping()
+         ->appendOutputTo(storage_path('logs/expected_checkin_escalation_run.log'));
 ```
-
-### Add or edit cron job
-
-```bash
-crontab -e
-```
-
-Example daily 8:00 AM run:
-
-```cron
-0 8 * * * /var/www/snipeit/expected_checkin_escalation.sh >> /home/administrator/expected_checkin_escalation_run.log 2>&1
-```
-
-### Remove cron job
-
-```bash
-crontab -e
-```
-
-Delete the escalation script line, then save and exit.
 
 ## What the script does
 
@@ -92,8 +82,14 @@ Example:
 ESCALATE_AFTER_DAYS=3
 RUN_MODE=live
 DISABLE_WEEKEND=true
-OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+# OVERRIDE_RECIPIENT="jwright@hvillepd.org"
+OVERRIDE_RECIPIENT=""
 DEBUG_LOG=false
+LOG_PII=false
+SEND_FAILURE_NOTICES=true
+FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
+SNIPEIT_PATH="/var/www/snipeit"
+LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
 API_LIMIT=100
 API_OFFSET=0
 # ==============================
@@ -166,9 +162,9 @@ FAILURE_NOTICE_RECIPIENT_OVERRIDE="you@example.org"
 
 ## Operational notes
 
-- Script log file: `/home/administrator/expected_checkin_escalation.log`
-- Cron stdout/stderr log file example: `/home/administrator/expected_checkin_escalation_run.log`
-- Recommended schedule: `0 8 * * *` (daily at 08:00 server time).
-- Runtime user: `administrator` (or dedicated service account with least privilege).
+- Script log file: `/var/www/snipeit/storage/logs/expected_checkin_escalation.log`
+- Scheduler output log file: `/var/www/snipeit/storage/logs/expected_checkin_escalation_run.log`
+- Recommended schedule in `Kernel.php`: `daily()`.
+- Runtime user: Laravel scheduler process user (commonly `www-data`).
 - On-call owner: your IT asset management support rotation.
 - Consider logrotate in production to manage growth of log files.
