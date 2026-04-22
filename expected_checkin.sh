@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Version: 1.2.10
+# Version: 1.3.0
 # NOTE: Increment this version for every code change to this script.
 #
 # Expected Check-In Script (Enhanced)
@@ -12,7 +12,7 @@
 #   can customize it over time.
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.10"
+SCRIPT_VERSION="1.3.0"
 BASE_URL="http://hpd-assetmanagement/api/v1"
 TOKEN="${SNIPEIT_API_TOKEN:-}"
 
@@ -30,6 +30,8 @@ FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
 FAILURE_NOTICE_MAX_EVENTS=50
 EMAIL_SIGNATURE_NAME="HPD Asset Management"
 EMAIL_SIGNATURE_ADDRESS="support@hvillepd.org"
+EMAIL_SUBJECT_DEFAULT="⏰Expected asset checkin report"
+HTML_TEMPLATE_FILE="/var/www/snipeit/email_templates/expected_checkin.html"
 TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
 SNIPEIT_PATH="/var/www/snipeit"
 ENV_FILE="/var/www/snipeit/.env"
@@ -49,6 +51,7 @@ FAILURE_NOTICE_RECIPIENT=""
 FAILURE_NOTICE_QUEUED_COUNT=0
 FAILURE_NOTICE_DROPPED_COUNT=0
 FAILURE_NOTICE_LINES=()
+HTML_TEMPLATE_MISSING_NOTICE_SENT=false
 
 apply_cli_overrides() {
   local arg key value chunk
@@ -188,6 +191,7 @@ send_email_laravel() {
   local recipient="$1"
   local subject="$2"
   local body="$3"
+  local is_html="${4:-false}"
 
   mkdir -p "$SNIPEIT_PATH/storage/.config/psysh"
   cd "$SNIPEIT_PATH"
@@ -195,13 +199,60 @@ send_email_laravel() {
   MAIL_TO="$recipient" \
   MAIL_SUBJECT="$subject" \
   MAIL_BODY="$body" \
+  MAIL_IS_HTML="$is_html" \
   HOME="$SNIPEIT_PATH" \
   XDG_CONFIG_HOME="$SNIPEIT_PATH/storage/.config" \
   php artisan tinker --execute="
-Mail::raw(getenv('MAIL_BODY'), function (\$message) {
-    \$message->to(getenv('MAIL_TO'))->subject(getenv('MAIL_SUBJECT'));
-});
+if (getenv('MAIL_IS_HTML') === 'true') {
+    Mail::send([], [], function (\$message) {
+        \$message->to(getenv('MAIL_TO'))->subject(getenv('MAIL_SUBJECT'));
+        \$message->setBody(getenv('MAIL_BODY'), 'text/html');
+    });
+} else {
+    Mail::raw(getenv('MAIL_BODY'), function (\$message) {
+        \$message->to(getenv('MAIL_TO'))->subject(getenv('MAIL_SUBJECT'));
+    });
+}
 " 2>&1
+}
+
+render_html_template() {
+  local template_file="$1"
+  shift
+
+  if [[ ! -r "$template_file" ]]; then
+    if [[ "$HTML_TEMPLATE_MISSING_NOTICE_SENT" != "true" ]]; then
+      log_message "ERROR" "HTML_TEMPLATE_MISSING path=\"$template_file\""
+      send_failure_notice \
+        "Snipe-IT Expected Check-In Script Failure: HTML Template Missing" \
+        "The expected check-in script could not read the configured HTML template at $template_file."
+      HTML_TEMPLATE_MISSING_NOTICE_SENT=true
+    fi
+    return 1
+  fi
+
+  printf '%s\n' "$@" | TEMPLATE_FILE="$template_file" python3 -c '
+import os
+import re
+import sys
+
+template_path = os.environ["TEMPLATE_FILE"]
+with open(template_path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+tokens = {}
+for raw in sys.stdin.read().splitlines():
+    if "=" not in raw:
+        continue
+    key, value = raw.split("=", 1)
+    tokens[key.strip().lower()] = value
+
+def repl(match):
+    token = match.group(1).lower()
+    return tokens.get(token, match.group(0))
+
+print(re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", repl, content), end="")
+'
 }
 
 send_failure_notice() {
@@ -569,7 +620,7 @@ while true; do
 
     would_notify_count=$((would_notify_count + 1))
 
-    EMAIL_SUBJECT="HPD Asset Management Notice: Asset Overdue for Check-In – $ASSET_TAG"
+    EMAIL_SUBJECT="$EMAIL_SUBJECT_DEFAULT"
     EMAIL_BODY="$assigned_name,
 
 This is an automated reminder that the following asset assigned to you appears overdue for check-in.
@@ -592,6 +643,11 @@ If you need to request an extension, reply with:
 Thank you,
 $EMAIL_SIGNATURE_NAME
 $EMAIL_SIGNATURE_ADDRESS"
+    use_html="false"
+    if rendered_html="$(render_html_template "$HTML_TEMPLATE_FILE" "asset_tag=$ASSET_TAG" "asset_name=$asset_name" "asset_model=$asset_model" "asset_serial=$asset_serial" "checkout_date=$last_checkout_formatted" "expected_checkin_date=$expected_checkin_formatted" "days_overdue=$days_overdue" "assigned_name=$assigned_name" "assigned_email=$assigned_email" "support_name=$EMAIL_SIGNATURE_NAME" "support_email=$EMAIL_SIGNATURE_ADDRESS" "email_subject=$EMAIL_SUBJECT_DEFAULT")"; then
+      EMAIL_BODY="$rendered_html"
+      use_html="true"
+    fi
 
     should_send_email="false"
     if [[ "$RUN_MODE" == "live" ]]; then
@@ -608,16 +664,30 @@ $EMAIL_SIGNATURE_ADDRESS"
 $EMAIL_BODY"
       fi
 
-      send_output="$(send_email_laravel "$final_recipient" "$EMAIL_SUBJECT" "$EMAIL_BODY")" || {
-        log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email error=\"$send_output\""
-        send_failure_notice \
-          "Snipe-IT Expected Check-In Script Failure: Notification Email Send Failed" \
-          "The script failed to send expected check-in email for asset tag $ASSET_TAG to $final_recipient. Error: $send_output"
-        continue
-      }
+      recipients=()
+      if [[ "$RUN_MODE" == "live" && -z "$OVERRIDE_RECIPIENT" ]]; then
+        recipients+=("$assigned_email")
+        if [[ -n "$FAILURE_NOTICE_RECIPIENT" && "$FAILURE_NOTICE_RECIPIENT" != "$assigned_email" ]]; then
+          recipients+=("$FAILURE_NOTICE_RECIPIENT")
+        fi
+      else
+        recipients+=("$final_recipient")
+      fi
 
-      log_message "INFO" "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue"
-      sent_count=$((sent_count + 1))
+      email_sent_for_asset=0
+      for recipient in "${recipients[@]}"; do
+        send_output="$(send_email_laravel "$recipient" "$EMAIL_SUBJECT" "$EMAIL_BODY" "$use_html")" || {
+          log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$recipient assigned_username=$assigned_username assigned_email=$assigned_email error=\"$send_output\""
+          send_failure_notice \
+            "Snipe-IT Expected Check-In Script Failure: Notification Email Send Failed" \
+            "The script failed to send expected check-in email for asset tag $ASSET_TAG to $recipient. Error: $send_output"
+          continue
+        }
+
+        log_message "INFO" "EMAIL_SENT asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$recipient assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue"
+        email_sent_for_asset=$((email_sent_for_asset + 1))
+      done
+      sent_count=$((sent_count + email_sent_for_asset))
     else
       log_message "INFO" "WOULD_NOTIFY asset_tag=$ASSET_TAG asset_id=$asset_id final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email days_overdue=$days_overdue run_mode=$RUN_MODE"
     fi
