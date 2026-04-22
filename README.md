@@ -30,6 +30,18 @@ OVERRIDE_RECIPIENT="jwright@hvillepd.org"
 /var/www/snipeit/expected_checkin_escalation.sh
 ```
 
+CLI override example (without editing the file):
+
+```bash
+/var/www/snipeit/expected_checkin_escalation.sh RUN_MODE=dry-run SEND_DRY_RUN_PREVIEW_IF_NONE=false LOG_FILE=/var/www/snipeit/storage/logs/expected_checkin_escalation_TEMP.log
+```
+
+Also supported:
+
+```bash
+/var/www/snipeit/expected_checkin_escalation.sh --set=RUN_MODE=dry-run,SEND_DRY_RUN_PREVIEW_IF_NONE=false,LOG_FILE=/var/www/snipeit/storage/logs/expected_checkin_escalation_TEMP.log
+```
+
 ## How to edit
 
 Use:
@@ -59,7 +71,7 @@ $schedule->exec('/var/www/snipeit/expected_checkin_escalation.sh')
 4. Iterates assets and checks eligibility for escalation (checked out, expected check-in present, overdue).
 5. Resolves assigned user + manager data and determines escalation eligibility threshold.
 6. Uses structured execution modes (`test`, `dry-run`, `live`) to reduce accidental sends.
-7. Sends escalation email only in `live` mode when threshold is met.
+7. Sends escalation email in `live`, or in `dry-run` only when `OVERRIDE_RECIPIENT` is configured.
 8. Sends failure notice emails (if enabled) when API/processing failures occur or when user manager is not configured.
 9. Writes run/audit details to the log file with configurable debug verbosity and optional PII redaction.
 
@@ -84,14 +96,21 @@ RUN_MODE=live
 DISABLE_WEEKEND=true
 # OVERRIDE_RECIPIENT="jwright@hvillepd.org"
 OVERRIDE_RECIPIENT=""
+SEND_DRY_RUN_PREVIEW_IF_NONE=true
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
 FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
+FAILURE_NOTICE_MAX_EVENTS=50
+TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
+ENV_FILE="/var/www/snipeit/.env"
 SNIPEIT_PATH="/var/www/snipeit"
 LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
 API_LIMIT=100
 API_OFFSET=0
+API_MAX_RETRIES=3
+API_RETRY_DELAY_SECONDS=2
+API_REQUEST_DELAY_SECONDS=0.10
 # ==============================
 # Configuration (end)
 # ==============================
@@ -104,7 +123,7 @@ This block includes run mode, escalation threshold, override recipient, path/log
 Set `RUN_MODE` before running:
 
 - `RUN_MODE=test` → validates dependencies and API health only; no processing emails.
-- `RUN_MODE=dry-run` → full processing, no escalation emails sent.
+- `RUN_MODE=dry-run` → full processing; emails send **only if** `OVERRIDE_RECIPIENT` is configured.
 - `RUN_MODE=live` → full processing and sends escalation emails.
 - Script is configured for `live` mode in the configuration block by default.
 
@@ -141,6 +160,35 @@ OVERRIDE_RECIPIENT="jwright@hvillepd.org"
 OVERRIDE_RECIPIENT=""
 ```
 
+## Dry-run preview email option
+
+To force a test email when there are no overdue/escalation-eligible assets in `dry-run`, set:
+
+```bash
+SEND_DRY_RUN_PREVIEW_IF_NONE=true
+```
+
+This sends a single preview message to `OVERRIDE_RECIPIENT` **only when all of the following are true**:
+1. `RUN_MODE=dry-run`
+2. `OVERRIDE_RECIPIENT` is configured
+3. No assets are eligible for escalation in that run
+
+## Token storage (recommended)
+
+Do not hardcode API tokens in scripts.
+
+Preferred order used by the script:
+1. Environment variable: `SNIPEIT_API_TOKEN`
+2. Token file path from `TOKEN_FILE` (default: `/var/www/snipeit/.expected_checkin_api_token`)
+
+Example:
+
+```bash
+sudo install -o www-data -g www-data -m 600 /dev/null /var/www/snipeit/.expected_checkin_api_token
+sudo sh -c 'echo "YOUR_REAL_TOKEN" > /var/www/snipeit/.expected_checkin_api_token'
+sudo chown www-data:www-data /var/www/snipeit/.expected_checkin_api_token
+```
+
 ## Manager-not-configured fallback behavior
 
 If an assigned employee has no manager configured, the script:
@@ -159,6 +207,15 @@ To override the failure-notice recipient manually:
 ```bash
 FAILURE_NOTICE_RECIPIENT_OVERRIDE="you@example.org"
 ```
+
+Failure notices are batched and sent as a **single summary email per run** (up to `FAILURE_NOTICE_MAX_EVENTS` entries in the message body).
+Per-asset API lookup throttling/not-found errors (for example HTTP `429`/`404` during individual asset lookups) are suppressed from failure emails to reduce noise.
+
+Failure recipient resolution order:
+1. `FAILURE_NOTICE_RECIPIENT_OVERRIDE`
+2. Snipe-IT database `settings.alert_email` (via credentials in `.env`)
+3. Snipe-IT/Laravel fallback lookup (`alert_email`/`alerts_email`)
+4. Laravel `mail.from.address`
 
 ## Operational notes
 
