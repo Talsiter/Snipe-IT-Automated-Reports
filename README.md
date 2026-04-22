@@ -54,6 +54,12 @@ sudo nano /var/www/snipeit/expected_checkin_escalation.sh
 
 This script is now scheduled from Laravel `Kernel.php` instead of system cron.
 
+Open the scheduler file with:
+
+```bash
+sudo nano /var/www/snipeit/app/Console/Kernel.php
+```
+
 Example:
 
 ```php
@@ -106,6 +112,8 @@ TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
 ENV_FILE="/var/www/snipeit/.env"
 SNIPEIT_PATH="/var/www/snipeit"
 LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin_escalation.log"
+EMAIL_SUBJECT_DEFAULT="⏰Expected asset checkin report"
+HTML_TEMPLATE_FILE="/var/www/snipeit/email_templates/expected_checkin_escalation.html"
 API_LIMIT=100
 API_OFFSET=0
 API_MAX_RETRIES=3
@@ -138,6 +146,34 @@ Additional controls:
 
 - `LOG_PII=false` (default): redact emails/usernames in log entries.
 - `LOG_PII=true`: include raw emails/usernames in logs.
+
+### Delete the script log file (CLI)
+
+```bash
+rm -f /var/www/snipeit/storage/logs/expected_checkin_escalation.log
+```
+
+## HTML email template support
+
+- `HTML_TEMPLATE_FILE` points to an HTML file used for escalation notices.
+- If the file cannot be read, the script falls back to plain-text email and sends a single failure notification for that run.
+- Token replacement is case-insensitive (for example `$ASSET_TAG`, `$asset_tag`, and `$Asset_Tag` are all supported).
+- Default subject is controlled by `EMAIL_SUBJECT_DEFAULT` and defaults to `⏰Expected asset checkin report`.
+
+Supported tokens:
+
+- `$asset_tag`
+- `$asset_name`
+- `$asset_model`
+- `$asset_serial`
+- `$assigned_name`
+- `$assigned_email`
+- `$manager_name`
+- `$manager_email`
+- `$checkout_date`
+- `$expected_checkin_date`
+- `$days_overdue`
+- `$email_subject`
 
 ## Override recipient behavior (confirmed)
 

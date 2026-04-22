@@ -50,6 +50,12 @@ sudo nano /var/www/snipeit/expected_checkin.sh
 
 ## Scheduler integration (Laravel Kernel.php)
 
+Open the scheduler file with:
+
+```bash
+sudo nano /var/www/snipeit/app/Console/Kernel.php
+```
+
 ```php
 $schedule->exec('/var/www/snipeit/expected_checkin.sh')
          ->daily()
@@ -91,6 +97,8 @@ EMAIL_SIGNATURE_NAME="HPD Asset Management"
 EMAIL_SIGNATURE_ADDRESS="support@hvillepd.org"
 SNIPEIT_PATH="/var/www/snipeit"
 LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin.log"
+EMAIL_SUBJECT_DEFAULT="⏰Expected asset checkin report"
+HTML_TEMPLATE_FILE="/var/www/snipeit/email_templates/expected_checkin.html"
 API_LIMIT=100
 API_OFFSET=0
 API_MAX_RETRIES=3
@@ -113,6 +121,40 @@ API_REQUEST_DELAY_SECONDS=0.10
 - `DEBUG_LOG=true`: verbose logs including decision-level traces.
 - `LOG_PII=false` (default): redact email/user identifiers in logs.
 - `LOG_PII=true`: include email/user identifiers.
+
+### Delete the script log file (CLI)
+
+```bash
+rm -f /var/www/snipeit/storage/logs/expected_checkin.log
+```
+
+## HTML email template support
+
+- `HTML_TEMPLATE_FILE` points to an HTML file used for notification emails.
+- If the file cannot be read, the script falls back to plain-text email and sends a single failure notification for that run.
+- Token replacement is case-insensitive (for example `$ASSET_TAG`, `$asset_tag`, and `$Asset_Tag` are all supported).
+- Default subject is controlled by `EMAIL_SUBJECT_DEFAULT` and defaults to `⏰Expected asset checkin report`.
+
+Supported tokens:
+
+- `$asset_tag`
+- `$asset_name`
+- `$asset_model`
+- `$asset_serial`
+- `$checkout_date`
+- `$expected_checkin_date`
+- `$days_overdue`
+- `$assigned_name`
+- `$assigned_email`
+- `$support_name`
+- `$support_email`
+- `$email_subject`
+
+## Expected check-in recipient behavior
+
+- In `live` mode with no override, one email is sent to the assigned user and a separate email is sent to the configured alert email recipient.
+- Alert email is resolved from the existing failure-notice recipient resolution path (`FAILURE_NOTICE_RECIPIENT_OVERRIDE` → `settings.alert_email` → Laravel fallback).
+- In `dry-run` with `OVERRIDE_RECIPIENT`, only the override recipient is used.
 
 ## Override recipient behavior
 
