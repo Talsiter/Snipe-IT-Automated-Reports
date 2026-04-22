@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Version: 1.0.0
+# Version: 1.2.10
 # NOTE: Increment this version for every code change to this script.
 #
 # Expected Check-In Script (Enhanced)
@@ -12,25 +12,33 @@
 #   can customize it over time.
 set -euo pipefail
 
+SCRIPT_VERSION="1.2.10"
 BASE_URL="http://hpd-assetmanagement/api/v1"
-TOKEN="PASTE_YOUR_TOKEN_HERE"
+TOKEN="${SNIPEIT_API_TOKEN:-}"
 
 # ==============================
 # Configuration (edit this block)
 # ==============================
 RUN_MODE=live
-DISABLE_WEEKEND=true
+DISABLE_WEEKEND=false
 OVERRIDE_RECIPIENT=""
+SEND_DRY_RUN_PREVIEW_IF_NONE=true
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
 FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
+FAILURE_NOTICE_MAX_EVENTS=50
 EMAIL_SIGNATURE_NAME="HPD Asset Management"
 EMAIL_SIGNATURE_ADDRESS="support@hvillepd.org"
+TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
 SNIPEIT_PATH="/var/www/snipeit"
+ENV_FILE="/var/www/snipeit/.env"
 LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin.log"
 API_LIMIT=100
 API_OFFSET=0
+API_MAX_RETRIES=3
+API_RETRY_DELAY_SECONDS=2
+API_REQUEST_DELAY_SECONDS=0.10
 # ==============================
 # Configuration (end)
 # ==============================
@@ -38,10 +46,66 @@ API_OFFSET=0
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 TODAY="$(date +%F)"
 FAILURE_NOTICE_RECIPIENT=""
+FAILURE_NOTICE_QUEUED_COUNT=0
+FAILURE_NOTICE_DROPPED_COUNT=0
+FAILURE_NOTICE_LINES=()
+
+apply_cli_overrides() {
+  local arg key value chunk
+  local -a chunks
+
+  for arg in "$@"; do
+    if [[ "$arg" == --set=* ]]; then
+      chunk="${arg#--set=}"
+      IFS=',' read -r -a chunks <<< "$chunk"
+      for chunk in "${chunks[@]}"; do
+        key="${chunk%%=*}"
+        value="${chunk#*=}"
+        key="${key#-}"
+        if [[ -n "$key" && "$key" != "$value" ]]; then
+          printf -v "$key" '%s' "$value"
+        fi
+      done
+      continue
+    fi
+
+    key="${arg%%=*}"
+    value="${arg#*=}"
+    key="${key#-}"
+
+    if [[ -n "$key" && "$key" != "$value" ]]; then
+      printf -v "$key" '%s' "$value"
+    fi
+  done
+}
+
+resolve_token() {
+  if [[ -n "$TOKEN" ]]; then
+    return 0
+  fi
+
+  if [[ -r "$TOKEN_FILE" ]]; then
+    TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r' | xargs)"
+  elif [[ -e "$TOKEN_FILE" ]]; then
+    echo "Token file exists but is not readable: $TOKEN_FILE"
+    log_message "ERROR" "CONFIG_INVALID token_file_unreadable path=\"$TOKEN_FILE\""
+    return 1
+  fi
+
+  if [[ -z "$TOKEN" || "$TOKEN" == "PASTE_YOUR_TOKEN_HERE" ]]; then
+    echo "Missing API token. Set SNIPEIT_API_TOKEN or TOKEN_FILE."
+    log_message "ERROR" "CONFIG_MISSING token source=\"SNIPEIT_API_TOKEN or TOKEN_FILE\""
+    return 1
+  fi
+
+  return 0
+}
+
+apply_cli_overrides "$@"
 
 # RUN_MODE options:
 #   test    = dependency/config/API checks only, no asset processing, no email sends
-#   dry-run = full processing, no notification emails sent
+#   dry-run = full processing; emails send only when OVERRIDE_RECIPIENT is configured
 #   live    = full processing and sends notification emails
 case "$RUN_MODE" in
   test|dry-run|live)
@@ -125,11 +189,14 @@ send_email_laravel() {
   local subject="$2"
   local body="$3"
 
+  mkdir -p "$SNIPEIT_PATH/storage/.config/psysh"
   cd "$SNIPEIT_PATH"
 
   MAIL_TO="$recipient" \
   MAIL_SUBJECT="$subject" \
   MAIL_BODY="$body" \
+  HOME="$SNIPEIT_PATH" \
+  XDG_CONFIG_HOME="$SNIPEIT_PATH/storage/.config" \
   php artisan tinker --execute="
 Mail::raw(getenv('MAIL_BODY'), function (\$message) {
     \$message->to(getenv('MAIL_TO'))->subject(getenv('MAIL_SUBJECT'));
@@ -145,18 +212,60 @@ send_failure_notice() {
     return 0
   fi
 
-  if [[ -z "$FAILURE_NOTICE_RECIPIENT" ]]; then
-    log_message "ERROR" "FAILURE_NOTICE_SKIPPED reason=\"No failure notice recipient configured\""
+  if (( FAILURE_NOTICE_QUEUED_COUNT < FAILURE_NOTICE_MAX_EVENTS )); then
+    FAILURE_NOTICE_LINES+=("- [$TIMESTAMP] $subject :: $body")
+    FAILURE_NOTICE_QUEUED_COUNT=$((FAILURE_NOTICE_QUEUED_COUNT + 1))
+  else
+    FAILURE_NOTICE_DROPPED_COUNT=$((FAILURE_NOTICE_DROPPED_COUNT + 1))
+  fi
+
+  return 0
+}
+
+flush_failure_notices() {
+  if [[ "$SEND_FAILURE_NOTICES" != "true" ]]; then
     return 0
   fi
 
+  if (( FAILURE_NOTICE_QUEUED_COUNT == 0 )); then
+    return 0
+  fi
+
+  if [[ -z "$FAILURE_NOTICE_RECIPIENT" ]]; then
+    log_message "ERROR" "FAILURE_NOTICE_SKIPPED reason=\"No failure notice recipient configured\" queued=$FAILURE_NOTICE_QUEUED_COUNT dropped=$FAILURE_NOTICE_DROPPED_COUNT"
+    return 0
+  fi
+
+  local summary_subject="Snipe-IT Expected Check-In Script Failure Summary ($FAILURE_NOTICE_QUEUED_COUNT events)"
+  local summary_body
+  summary_body="Failure summary for expected_checkin.sh
+
+Run Date: $TODAY
+Run Mode: $RUN_MODE
+Queued Failures: $FAILURE_NOTICE_QUEUED_COUNT
+Dropped Failures (max cap reached): $FAILURE_NOTICE_DROPPED_COUNT
+
+Events:
+$(printf '%s\n' "${FAILURE_NOTICE_LINES[@]}")"
+
   local send_output
-  send_output="$(send_email_laravel "$FAILURE_NOTICE_RECIPIENT" "$subject" "$body")" || {
+  send_output="$(send_email_laravel "$FAILURE_NOTICE_RECIPIENT" "$summary_subject" "$summary_body")" || {
     log_message "ERROR" "FAILURE_NOTICE_SEND_FAILED recipient=$FAILURE_NOTICE_RECIPIENT error=\"$send_output\""
     return 1
   }
 
-  log_message "INFO" "FAILURE_NOTICE_SENT recipient=$FAILURE_NOTICE_RECIPIENT subject=\"$subject\""
+  log_message "INFO" "FAILURE_NOTICE_SENT recipient=$FAILURE_NOTICE_RECIPIENT subject=\"$summary_subject\" events=$FAILURE_NOTICE_QUEUED_COUNT dropped=$FAILURE_NOTICE_DROPPED_COUNT"
+}
+
+should_send_failure_notice_for_api() {
+  local context="$1"
+  local status="$2"
+
+  if [[ "$context" == asset\ lookup* && ( "$status" == "404" || "$status" == "429" || "$status" == "request_failed" ) ]]; then
+    return 1
+  fi
+
+  return 0
 }
 
 resolve_failure_notice_recipient() {
@@ -165,9 +274,38 @@ resolve_failure_notice_recipient() {
     return 0
   fi
 
-  cd "$SNIPEIT_PATH"
-  local resolved
-  resolved="$(php artisan tinker --execute="echo setting('alert_email') ?: config('mail.from.address');" 2>/dev/null | tail -n 1 | tr -d '\r' | xargs)"
+  local resolved=""
+  local db_host db_port db_name db_user db_password
+
+  if [[ -r "$ENV_FILE" ]] && command -v mysql >/dev/null 2>&1; then
+    db_host="$(sed -n 's/^DB_HOST=//p' "$ENV_FILE" | head -n 1 | tr -d '\r' | sed -E 's/^["'\'']|["'\'']$//g')"
+    db_port="$(sed -n 's/^DB_PORT=//p' "$ENV_FILE" | head -n 1 | tr -d '\r' | sed -E 's/^["'\'']|["'\'']$//g')"
+    db_name="$(sed -n 's/^DB_DATABASE=//p' "$ENV_FILE" | head -n 1 | tr -d '\r' | sed -E 's/^["'\'']|["'\'']$//g')"
+    db_user="$(sed -n 's/^DB_USERNAME=//p' "$ENV_FILE" | head -n 1 | tr -d '\r' | sed -E 's/^["'\'']|["'\'']$//g')"
+    db_password="$(sed -n 's/^DB_PASSWORD=//p' "$ENV_FILE" | head -n 1 | tr -d '\r' | sed -E 's/^["'\'']|["'\'']$//g')"
+
+    db_host="${db_host:-127.0.0.1}"
+    db_port="${db_port:-3306}"
+
+    resolved="$(MYSQL_PWD="$db_password" mysql -N -h "$db_host" -P "$db_port" -u "$db_user" -D "$db_name" -e "SELECT alert_email FROM settings LIMIT 1;" 2>/dev/null | head -n 1 | tr -d '\r' | xargs)"
+  fi
+
+  if [[ -z "$resolved" || "$resolved" == "null" ]]; then
+    mkdir -p "$SNIPEIT_PATH/storage/.config/psysh"
+    cd "$SNIPEIT_PATH"
+    resolved="$(HOME="$SNIPEIT_PATH" XDG_CONFIG_HOME="$SNIPEIT_PATH/storage/.config" php artisan tinker --execute="
+\$alertEmail = null;
+if (function_exists('setting')) { \$alertEmail = setting('alert_email'); }
+if (!\$alertEmail && class_exists('\\\\App\\\\Models\\\\Setting')) {
+    try {
+        \$settings = \\\\App\\\\Models\\\\Setting::getSettings();
+        if (is_object(\$settings) && !empty(\$settings->alert_email)) { \$alertEmail = \$settings->alert_email; }
+        if (is_object(\$settings) && empty(\$alertEmail) && !empty(\$settings->alerts_email)) { \$alertEmail = \$settings->alerts_email; }
+    } catch (\\\\Throwable \$e) {}
+}
+echo \$alertEmail ?: config('mail.from.address');
+" 2>/dev/null | tail -n 1 | tr -d '\r' | xargs)"
+  fi
 
   if [[ -n "$resolved" && "$resolved" != "null" ]]; then
     FAILURE_NOTICE_RECIPIENT="$resolved"
@@ -212,32 +350,51 @@ is_valid_json() {
 api_get() {
   local url="$1"
   local context="$2"
-  local response
-  local http_code
-  local body
+  local response http_code body
+  local attempt=1
 
-  response="$(curl -sS --connect-timeout 15 --max-time 60 \
-    -H "Accept: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -w $'\n%{http_code}' \
-    "$url")" || {
-      echo "API request failed for $context"
-      log_message "ERROR" "API_REQUEST_FAILED context=\"$context\" url=\"$url\""
-      send_failure_notice \
-        "Snipe-IT Expected Check-In Script Failure: API Request Failed" \
-        "The expected check-in script failed to connect to API endpoint: $url ($context)."
-      return 1
-    }
+  while true; do
+    response="$(curl -sS --connect-timeout 15 --max-time 60 \
+      -H "Accept: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -w $'\n%{http_code}' \
+      "$url")" || {
+        echo "API request failed for $context"
+        log_message "ERROR" "API_REQUEST_FAILED context=\"$context\" url=\"$url\""
+        if should_send_failure_notice_for_api "$context" "request_failed"; then
+          send_failure_notice \
+            "Snipe-IT Expected Check-In Script Failure: API Request Failed" \
+            "The expected check-in script failed to connect to API endpoint: $url ($context)."
+        else
+          log_message "INFO" "FAILURE_NOTICE_SUPPRESSED context=\"$context\" reason=\"Non-critical API request failure\""
+        fi
+        return 1
+      }
 
-  http_code="${response##*$'\n'}"
-  body="${response%$'\n'*}"
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    if [[ "$http_code" == "429" && $attempt -lt $API_MAX_RETRIES ]]; then
+      sleep_seconds=$(( API_RETRY_DELAY_SECONDS * attempt ))
+      log_message "ERROR" "API_RATE_LIMIT_RETRY context=\"$context\" url=\"$url\" attempt=$attempt sleep_seconds=$sleep_seconds"
+      sleep "$sleep_seconds"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    break
+  done
 
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
     echo "API returned HTTP $http_code for $context"
     log_message "ERROR" "API_HTTP_ERROR context=\"$context\" url=\"$url\" status=$http_code"
-    send_failure_notice \
-      "Snipe-IT Expected Check-In Script Failure: API HTTP Error" \
-      "The expected check-in script received HTTP status $http_code from endpoint: $url ($context)."
+    if should_send_failure_notice_for_api "$context" "$http_code"; then
+      send_failure_notice \
+        "Snipe-IT Expected Check-In Script Failure: API HTTP Error" \
+        "The expected check-in script received HTTP status $http_code from endpoint: $url ($context)."
+    else
+      log_message "INFO" "FAILURE_NOTICE_SUPPRESSED context=\"$context\" status=$http_code reason=\"Non-critical API HTTP error\""
+    fi
     return 1
   fi
 
@@ -251,10 +408,12 @@ api_get() {
   fi
 
   log_message "DEBUG" "API_SUCCESS context=\"$context\" url=\"$url\""
+  sleep "$API_REQUEST_DELAY_SECONDS"
   printf '%s' "$body"
 }
 
 echo "=== Expected Check-In ==="
+echo "Version: $SCRIPT_VERSION"
 echo "Today: $TODAY"
 echo "Run Mode: $RUN_MODE"
 echo "Disable Weekend: $DISABLE_WEEKEND"
@@ -263,10 +422,12 @@ echo "Send Failure Notices: $SEND_FAILURE_NOTICES"
 echo "Debug Logging: $DEBUG_LOG"
 echo
 
-log_message "INFO" "RUN_STARTED run_mode=$RUN_MODE override_recipient=${OVERRIDE_RECIPIENT:-none}"
+log_message "INFO" "RUN_STARTED version=$SCRIPT_VERSION run_mode=$RUN_MODE override_recipient=${OVERRIDE_RECIPIENT:-none}"
 
 check_dependencies || exit 1
+resolve_token || exit 1
 resolve_failure_notice_recipient || log_message "ERROR" "FAILURE_NOTICE_RECIPIENT_NOT_FOUND source=\"Snipe-IT Email Preferences\""
+trap 'flush_failure_notices' EXIT
 
 if [[ "$RUN_MODE" == "test" ]]; then
   echo "TEST MODE: Running API health check only."
@@ -432,7 +593,21 @@ Thank you,
 $EMAIL_SIGNATURE_NAME
 $EMAIL_SIGNATURE_ADDRESS"
 
+    should_send_email="false"
     if [[ "$RUN_MODE" == "live" ]]; then
+      should_send_email="true"
+    elif [[ "$RUN_MODE" == "dry-run" && -n "$OVERRIDE_RECIPIENT" ]]; then
+      should_send_email="true"
+    fi
+
+    if [[ "$should_send_email" == "true" ]]; then
+      if [[ "$RUN_MODE" == "dry-run" ]]; then
+        EMAIL_SUBJECT="[DRY-RUN] $EMAIL_SUBJECT"
+        EMAIL_BODY="DRY-RUN NOTICE: This email was sent from RUN_MODE=dry-run because OVERRIDE_RECIPIENT is configured.
+
+$EMAIL_BODY"
+      fi
+
       send_output="$(send_email_laravel "$final_recipient" "$EMAIL_SUBJECT" "$EMAIL_BODY")" || {
         log_message "ERROR" "EMAIL_SEND_FAILED asset_tag=$ASSET_TAG final_recipient=$final_recipient assigned_username=$assigned_username assigned_email=$assigned_email error=\"$send_output\""
         send_failure_notice \
@@ -451,6 +626,35 @@ $EMAIL_SIGNATURE_ADDRESS"
   API_OFFSET=$((API_OFFSET + API_LIMIT))
 done
 
+if (( would_notify_count == 0 )); then
+  log_message "INFO" "RUN_RESULT no_assets_notified processed=$processed_count skipped=$skipped_count"
+
+  if [[ "$RUN_MODE" == "dry-run" && -n "$OVERRIDE_RECIPIENT" && "$SEND_DRY_RUN_PREVIEW_IF_NONE" == "true" ]]; then
+    preview_subject="[DRY-RUN] HPD Asset Management Expected Check-In Preview (No Overdue Assets)"
+    preview_body="This is a dry-run preview email.
+
+RUN_MODE is set to dry-run and OVERRIDE_RECIPIENT is configured, but there were no overdue assets eligible for notification in this run.
+
+No action is required.
+
+Thank you,
+$EMAIL_SIGNATURE_NAME
+$EMAIL_SIGNATURE_ADDRESS"
+
+    preview_send_output="$(send_email_laravel "$OVERRIDE_RECIPIENT" "$preview_subject" "$preview_body")" || {
+      log_message "ERROR" "DRY_RUN_PREVIEW_SEND_FAILED final_recipient=$OVERRIDE_RECIPIENT error=\"$preview_send_output\""
+      send_failure_notice \
+        "Snipe-IT Expected Check-In Script Failure: Dry-Run Preview Email Send Failed" \
+        "The script failed to send dry-run preview email to $OVERRIDE_RECIPIENT. Error: $preview_send_output"
+      log_message "INFO" "RUN_SUMMARY processed=$processed_count would_notify=$would_notify_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
+      exit 1
+    }
+
+    sent_count=$((sent_count + 1))
+    log_message "INFO" "DRY_RUN_PREVIEW_SENT final_recipient=$OVERRIDE_RECIPIENT reason=\"No overdue assets\""
+  fi
+fi
+
 echo "=================================================="
 echo "SUMMARY"
 echo "Processed Assets: $processed_count"
@@ -458,9 +662,5 @@ echo "Would Notify: $would_notify_count"
 echo "Emails Sent: $sent_count"
 echo "Skipped / No Notification: $skipped_count"
 echo "Log File: $LOG_FILE"
-
-if (( would_notify_count == 0 )); then
-  log_message "INFO" "RUN_RESULT no_assets_notified processed=$processed_count skipped=$skipped_count"
-fi
 
 log_message "INFO" "RUN_SUMMARY processed=$processed_count would_notify=$would_notify_count sent=$sent_count skipped=$skipped_count run_mode=$RUN_MODE"
