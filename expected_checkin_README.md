@@ -28,6 +28,26 @@ OVERRIDE_RECIPIENT="jwright@hvillepd.org"
 /var/www/snipeit/expected_checkin.sh
 ```
 
+CLI override example (without editing the file):
+
+```bash
+/var/www/snipeit/expected_checkin.sh RUN_MODE=dry-run SEND_DRY_RUN_PREVIEW_IF_NONE=false LOG_FILE=/var/www/snipeit/storage/logs/expected_checkin_TEMP.log
+```
+
+Also supported:
+
+```bash
+/var/www/snipeit/expected_checkin.sh --set=RUN_MODE=dry-run,SEND_DRY_RUN_PREVIEW_IF_NONE=false,LOG_FILE=/var/www/snipeit/storage/logs/expected_checkin_TEMP.log
+```
+
+## How to edit
+
+Use:
+
+```bash
+sudo nano /var/www/snipeit/expected_checkin.sh
+```
+
 ## Scheduler integration (Laravel Kernel.php)
 
 ```php
@@ -43,7 +63,7 @@ $schedule->exec('/var/www/snipeit/expected_checkin.sh')
 2. Resolves failure notice recipient from `alert_email` with fallback to `mail.from.address`.
 3. Calls Snipe-IT APIs, validates HTTP status and JSON payloads before processing.
 4. Iterates assets and identifies expected-checkin overdue assets that are still checked out.
-5. Sends a notification to assigned user email (or configured override recipient).
+5. Sends a notification to assigned user email in `live`, or to override recipient in `dry-run` when configured.
 6. Supports `test`, `dry-run`, and `live` execution modes for controlled operations.
 7. Sends failure notices when critical API/email flow fails (if enabled).
 8. Logs run events and outcomes with optional debug verbosity and PII redaction.
@@ -57,18 +77,25 @@ All editable values are grouped in the configuration block near the top of `expe
 # Configuration (edit this block)
 # ==============================
 RUN_MODE=live
-DISABLE_WEEKEND=true
+DISABLE_WEEKEND=false
 OVERRIDE_RECIPIENT=""
+SEND_DRY_RUN_PREVIEW_IF_NONE=true
 DEBUG_LOG=false
 LOG_PII=false
 SEND_FAILURE_NOTICES=true
 FAILURE_NOTICE_RECIPIENT_OVERRIDE=""
+FAILURE_NOTICE_MAX_EVENTS=50
+TOKEN_FILE="/var/www/snipeit/.expected_checkin_api_token"
+ENV_FILE="/var/www/snipeit/.env"
 EMAIL_SIGNATURE_NAME="HPD Asset Management"
 EMAIL_SIGNATURE_ADDRESS="support@hvillepd.org"
 SNIPEIT_PATH="/var/www/snipeit"
 LOG_FILE="/var/www/snipeit/storage/logs/expected_checkin.log"
 API_LIMIT=100
 API_OFFSET=0
+API_MAX_RETRIES=3
+API_RETRY_DELAY_SECONDS=2
+API_REQUEST_DELAY_SECONDS=0.10
 # ==============================
 # Configuration (end)
 # ==============================
@@ -77,7 +104,7 @@ API_OFFSET=0
 ## Execution modes
 
 - `RUN_MODE=test` → dependency + API health check only.
-- `RUN_MODE=dry-run` → full processing, no emails sent.
+- `RUN_MODE=dry-run` → full processing; emails send **only if** `OVERRIDE_RECIPIENT` is configured.
 - `RUN_MODE=live` → full processing with email sends.
 
 ## Logging behavior
@@ -92,13 +119,46 @@ API_OFFSET=0
 If `OVERRIDE_RECIPIENT` is set, all notification emails go to that address.
 If blank, notifications go to the assigned user email from Snipe-IT.
 
+## Dry-run preview email option
+
+To force a test email when there are no overdue assets in `dry-run`, set:
+
+```bash
+SEND_DRY_RUN_PREVIEW_IF_NONE=true
+```
+
+This sends a single preview message to `OVERRIDE_RECIPIENT` **only when all of the following are true**:
+1. `RUN_MODE=dry-run`
+2. `OVERRIDE_RECIPIENT` is configured
+3. No assets are eligible for notification in that run
+
 ## Failure notice behavior
 
 If `SEND_FAILURE_NOTICES=true`, script sends failure notices for critical failures.
 Recipient resolution order:
 1. `FAILURE_NOTICE_RECIPIENT_OVERRIDE`
-2. Snipe-IT setting `alert_email`
-3. Laravel `mail.from.address`
+2. Snipe-IT database `settings.alert_email` (via credentials in `.env`)
+3. Snipe-IT/Laravel fallback lookup (`alert_email`/`alerts_email`)
+4. Laravel `mail.from.address`
+
+Failure notices are batched and sent as a **single summary email per run** (up to `FAILURE_NOTICE_MAX_EVENTS` entries in the message body).
+Per-asset API lookup throttling/not-found errors (for example HTTP `429`/`404` during individual asset lookups) are suppressed from failure emails to reduce noise.
+
+## Token storage (recommended)
+
+Do not hardcode the API token in the script.
+
+Preferred order used by the script:
+1. Environment variable: `SNIPEIT_API_TOKEN`
+2. Token file path from `TOKEN_FILE` (default: `/var/www/snipeit/.expected_checkin_api_token`)
+
+Example:
+
+```bash
+sudo install -o www-data -g www-data -m 600 /dev/null /var/www/snipeit/.expected_checkin_api_token
+sudo sh -c 'echo "YOUR_REAL_TOKEN" > /var/www/snipeit/.expected_checkin_api_token'
+sudo chown www-data:www-data /var/www/snipeit/.expected_checkin_api_token
+```
 
 ## Operational notes
 
