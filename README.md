@@ -54,6 +54,12 @@ sudo nano /var/www/snipeit/expected_checkin_escalation.sh
 
 This script is now scheduled from Laravel `Kernel.php` instead of system cron.
 
+Edit Kernel.php
+sudo nano /var/www/snipeit/app/Console/Kernel.php
+```bash
+sudo nano /var/www/snipeit/app/Console/Kernel.php
+```
+
 Example:
 
 ```php
